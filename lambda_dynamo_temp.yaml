@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+  # DynamoDB Table with Stream Enabled
+  ContactsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Contacts
+      AttributeDefinitions:
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: timestamp
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES  # Stream set to capture both new and old images
+
+  # IAM Role for AddContactInfo Lambda (DynamoDB access)
+  LambdaRoleToAccessDynamoDB:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaDynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ContactsTable.Arn
+
+  # IAM Role for SendContactInfoEmail Lambda (SES + DynamoDB Stream access)
+  LambdaRoleToSendEmail:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaSESDynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource: !GetAtt ContactsTable.StreamArn
+
+  # AddContactInfo Lambda Function (Save to DynamoDB)
+  AddContactInfoLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AddContactInfo
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRoleToAccessDynamoDB.Arn
+      Runtime: python3.9  # Updated runtime version to python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              db = boto3.resource('dynamodb')
+              table = db.Table('Contacts')
+              timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+              
+              try:
+                  payload = json.loads(event['body'])
+                  table.put_item(
+                      Item={
+                          'timestamp': timestamp,
+                          'name': payload['name'],
+                          'email': payload['email'],
+                          'message': payload['msg']
+                      }
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully saved contact info!'),
+                      'headers': {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Methods": "OPTIONS,POST",
+                          "Access-Control-Allow-Headers": "Content-Type",
+                          "Access-Control-Allow-Credentials": True
+                      }
+                  }
+
+              except Exception as e:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps('Error saving contact info: ' + str(e)),
+                      'headers': {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Methods": "OPTIONS,POST",
+                          "Access-Control-Allow-Headers": "Content-Type",
+                          "Access-Control-Allow-Credentials": True
+                      }
+                  }
+
+  # SendContactInfoEmail Lambda Function (Send email via SES)
+  SendContactInfoEmailLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SendContactInfoEmail
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRoleToSendEmail.Arn
+      Runtime: python3.9  # Updated runtime version to python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          ses_client = boto3.client('ses')
+
+          def lambda_handler(event, context):
+              payload = event['Records'][0]['dynamodb']['NewImage']
+              sender = "altoumibrahim11@gmail.com"  # Sender email
+              recipient = "samirmoh2024@gmail.com"  # Recipient email
+              subject = "New Contact Submission"
+              body_text = f"Name: {payload['name']['S']}\nEmail: {payload['email']['S']}\nMessage: {payload['message']['S']}"
+
+              try:
+                  response = ses_client.send_email(
+                      Source=sender,
+                      Destination={'ToAddresses': [recipient]},
+                      Message={
+                          'Subject': {'Data': subject},
+                          'Body': {'Text': {'Data': body_text}}
+                      }
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Email sent successfully!'),
+                      'headers': {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Methods": "OPTIONS,POST",
+                          "Access-Control-Allow-Headers": "Content-Type",
+                          "Access-Control-Allow-Credentials": True
+                      }
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps(f"Error sending email: {str(e)}"),
+                      'headers': {
+                          "Access-Control-Allow-Origin": "*",
+                          "Access-Control-Allow-Methods": "OPTIONS,POST",
+                          "Access-Control-Allow-Headers": "Content-Type",
+                          "Access-Control-Allow-Credentials": True
+                      }
+                  }
+
+  # DynamoDB Stream Trigger for SendContactInfoEmailLambda
+  DynamoDBStreamToLambda:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 5
+      EventSourceArn: !GetAtt ContactsTable.StreamArn
+      FunctionName: !Ref SendContactInfoEmailLambda
+      StartingPosition: TRIM_HORIZON
+
+  # API Gateway to expose the Lambda functions as REST APIs
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ContactInfoApi
+      Description: API to submit contact information to DynamoDB and send an email
+
+  # Resource for POST /AddContactInfo
+  AddContactInfoResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: AddContactInfo
+      RestApiId: !Ref ApiGateway
+
+  # Method for POST on /AddContactInfo
+  AddContactInfoMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref AddContactInfoResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AddContactInfoLambda.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  # Enable CORS for the /AddContactInfo resource
+  AddContactInfoCorsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref AddContactInfoResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationHttpMethod: OPTIONS
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  # Lambda permission to allow API Gateway to invoke the Lambda functions
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AddContactInfoLambda
+      Principal: apigateway.amazonaws.com
+
+  # Lambda permission to allow API Gateway to invoke SendContactInfoEmailLambda
+  LambdaInvokeEmailPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SendContactInfoEmailLambda
+      Principal: apigateway.amazonaws.com
+
+  # API Gateway Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+    DependsOn:
+      - AddContactInfoMethod
+      - AddContactInfoCorsOptions

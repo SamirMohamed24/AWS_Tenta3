@@ -1,0 +1,396 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Setup SES Identities, DynamoDB, API Gateway, and Lambda Function for Email Notifications
+
+Resources:
+
+  # DynamoDB Table
+  ContactInfoTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: 'ContactInfoTable'
+      AttributeDefinitions:
+        - AttributeName: 'timestamp'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'timestamp'
+          KeyType: 'HASH'
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # IAM Role for Lambda Accessing DynamoDB, S3, and SES
+  LambdaAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaAccessRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FullDynamoDBAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:*
+                Resource: "*"
+        - PolicyName: AWSLambdaBasicExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: "arn:aws:logs:*:*:*"
+        - PolicyName: FullSESPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ses:*
+                Resource: "*"
+        - PolicyName: FullS3AccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${StaticWebsiteBucket}/*"
+                  - !Sub "arn:aws:s3:::${StaticWebsiteBucket}"
+
+  # Lambda Function to Store Contact Info
+  StoreContactInfoFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - ContactInfoTable
+      - LambdaAccessRole
+    Properties:
+      FunctionName: StoreContactInfoFunction
+      Runtime: python3.9
+      Role: !GetAtt LambdaAccessRole.Arn
+      Handler: Lambda_function.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              db = boto3.resource('dynamodb')
+              table = db.Table('ContactInfoTable')
+              timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+              try:
+                  payload = json.loads(event['body'])
+                  table.put_item(
+                      Item={
+                          'timestamp': timestamp,
+                          'name': payload['name'],
+                          'email': payload['email'],
+                          'message': payload['msg']
+                      }
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Contact info stored successfully!'),
+                      'headers': {
+                          "Access-Control-Allow-Origin": "*"
+                      }
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f"Error: {str(e)}"),
+                      'headers': {
+                          "Access-Control-Allow-Origin": "*"
+                      }
+                  }
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ContactInfoApi
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      RestApiId: !Ref ApiGateway
+      PathPart: 'AddContactInfo3'
+
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn:
+      - ApiResource
+      - StoreContactInfoFunction
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: "AWS_PROXY"
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StoreContactInfoFunction.Arn}/invocations"
+      MethodResponses:
+        - StatusCode: "200"
+
+  ApiGatewayOptions:
+    Type: AWS::ApiGateway::Method
+    DependsOn:
+      - ApiMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiResource
+      HttpMethod: "OPTIONS"
+      AuthorizationType: "NONE"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            'method.response.header.Access-Control-Allow-Methods': "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+            'method.response.header.Access-Control-Allow-Origin': "'*'"
+      Integration:
+        Type: "MOCK"
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              'method.response.header.Access-Control-Allow-Methods': "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StoreContactInfoFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 
+        arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/AddContactInfo3
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: default
+
+  # S3 Bucket for Static Website
+  StaticWebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: static-contact-website
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  # S3 Bucket Policy for Public Read Access
+  StaticWebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticWebsiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${StaticWebsiteBucket}/*"
+
+          # Lambda Execution Role to Allow Upload to S3
+  LambdaS3UploadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-LambdaS3UploadRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                Resource: !Sub "${StaticWebsiteBucket.Arn}/*"
+
+
+  # Lambda Function to Upload index.html
+  S3UploadLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - StaticWebsiteBucket
+      - LambdaS3UploadRole
+    Properties:
+      FunctionName: UploadHTMLFunction
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaS3UploadRole.Arn
+      Runtime: python3.9
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref StaticWebsiteBucket
+          API_ID: !Ref ApiGateway
+          API_Region: !Ref AWS::Region
+          API_STAGE: "default"
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import urllib.request
+
+          s3_client = boto3.client('s3')
+
+          # Function to send a response to CloudFormation
+          def send_response(event, context, status, response_data):
+              response_url = event['ResponseURL']
+              response_body = json.dumps({
+                  'Status': status,
+                  'Reason': 'See the details in CloudWatch Log Stream: ' + context.log_stream_name,
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              })
+
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(response_body))
+              }
+
+              try:
+                  request = urllib.request.Request(
+                      response_url,
+                      data=response_body.encode('utf-8'),
+                      headers=headers,
+                      method='PUT'
+                  )
+                  urllib.request.urlopen(request)
+                  print("Response sent to CloudFormation successfully.")
+              except Exception as e:
+                  print(f"Failed to send response: {e}")
+
+          # Lambda handler function
+          def lambda_handler(event, context):
+              print("Received event:", json.dumps(event))
+
+              # Define bucket name and file content
+              bucket_name = os.environ.get('BUCKET_NAME', 'default-bucket-name')
+              api_id = os.environ.get('API_ID', '')
+              api_region = os.environ.get('API_REGION', '')
+              api_stage = os.environ.get('API_STAGE', 'default')
+
+              # Construct the API endpoint URL
+              api_endpoint = f"https://{api_id}.execute-api.{api_region}.amazonaws.com/{api_stage}/AddContactInfo"
+              
+              html_content = f"""
+              <!DOCTYPE html>
+              <html>
+              <head>
+                  <title>Contact Form</title>
+                  <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.min.css">
+              </head>
+              <body>
+                  <div class="container">
+                      <h1>Contact Form</h1>
+                      <form id="contactForm" method="POST">
+                          <div class="form-group">
+                              <label for="name">Name:</label>
+                              <input type="text" class="form-control" id="name" name="name" required>
+                          </div>
+                          <div class="form-group">
+                              <label for="email">Email:</label>
+                              <input type="email" class="form-control" id="email" name="email" required>
+                          </div>
+                          <div class="form-group">
+                              <label for="msg">Message:</label>
+                              <textarea class="form-control" id="msg" name="msg" rows="4" cols="50" required></textarea>
+                          </div>
+                          <input type="submit" class="btn btn-primary" value="Submit">
+                      </form>
+                  </div>
+                  <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+                  <script src="https://cdn.jsdelivr.net/npm/bootstrap@4.5.0/dist/js/bootstrap.min.js"></script>
+                  <script>
+                      const ApiUrl = "{api_endpoint}";
+                      document.getElementById("contactForm").addEventListener("submit", function(event) {{
+                          event.preventDefault();
+                          var formData = {{
+                              name: document.getElementById("name").value,
+                              email: document.getElementById("email").value,
+                              msg: document.getElementById("msg").value
+                          }};
+                          fetch(ApiUrl, {{
+                              method: "POST",
+                              body: JSON.stringify(formData)
+                          }})
+                          .then(response => {{
+                              if (response.ok) {{
+                                  alert("Form submitted successfully");
+                              }} else {{
+                                  alert("Form submission failed");
+                              }}
+                          }})
+                          .catch(error => {{
+                              console.error("An error occurred:", error);
+                          }});
+                      }});
+                  </script>
+              </body>
+              </html>
+              """
+
+              try:
+                  # Upload the HTML content to S3 bucket
+                  s3_client.put_object(
+                      Bucket=bucket_name,
+                      Key='index.html',
+                      Body=html_content,
+                      ContentType='text/html'
+                  )
+                  print(f"File uploaded successfully to {bucket_name}/index.html")
+
+                  # Send a success response to CloudFormation
+                  send_response(event, context, 'SUCCESS', {'Message': 'index.html uploaded successfully'})
+
+              except Exception as e:
+                  print(f"Error uploading file: {e}")
+                  # Send a failure response to CloudFormation
+                  send_response(event, context, 'FAILED', {'Message': str(e)})
+
+
+  #Invoke Lambda Function
+  InvokeHTMLupload:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - ApiGateway
+      - StaticWebsiteBucket
+    Properties:
+      ServiceToken: !GetAtt S3UploadLambdaFunction.Arn
